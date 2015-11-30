@@ -63,7 +63,7 @@ import com.sun.media.imageioimpl.plugins.raw.RawImageWriterSpi;
  * Map producer for producing Raw bil images out of an elevation model.
  * Modeled after the GeoTIFFMapResponse, relying on Geotools and the
  * RawImageWriterSpi
- * @author Tishampati Dhar
+ * @author Tishampati Dhar, Piero Toffanin
  * @since 2.0.x
  * 
  */
@@ -99,7 +99,7 @@ public final class BilMapResponse extends RenderedImageMapResponse {
 		//TODO: Write reprojected terrain tile
 		// TODO Get request tile size
 		final GetMapRequest request = mapContent.getRequest();
-		String bilEncoding = (String) request.getFormat();
+		String requestedBilEncoding = (String) request.getFormat();
 
 		int height = request.getHeight();
 		int width = request.getWidth();
@@ -111,139 +111,144 @@ public final class BilMapResponse extends RenderedImageMapResponse {
 
 		List<MapLayerInfo> reqlayers = request.getLayers();
 
-		//Can't fetch bil for more than 1 layer
-		if (reqlayers.size() > 1) 
-		{
-			throw new ServiceException("Cannot combine layers into BIL output");
-		}
-		
-		// Get BIL layer configuration. This configuration is set by the server administrator
-		// using the BIL layer config panel.
-		MapLayerInfo mapLayerInfo = reqlayers.get(0);
-		MetadataMap metadata = mapLayerInfo.getResource().getMetadata();
-
-		String defaultDataType = (String) metadata.get(BilConfig.DEFAULT_DATA_TYPE);
-		String byteOrder = (String) metadata.get(BilConfig.BYTE_ORDER);
-
-		Double outNoData = null;
-		Object noDataParam = metadata.get(BilConfig.NO_DATA_OUTPUT);
-		if (noDataParam instanceof Number)
-		{
-		    outNoData = ((Number) noDataParam).doubleValue();
-		} else if (noDataParam instanceof String)
-		{
-    		try
-    		{
-    			outNoData = Double.parseDouble((String) noDataParam);
-    		} catch (NumberFormatException e)
-    		{
-    			LOGGER.warning("Can't parse output no data attribute: " + e.getMessage()); // TODO localize
-    		}
-		}
-
-		GridCoverage2DReader coverageReader = (GridCoverage2DReader) mapLayerInfo.getCoverageReader();
-	    GeneralEnvelope destinationEnvelope = new GeneralEnvelope(mapContent.getRenderingArea());
-		
-		/*
-		 * Try to use a gridcoverage style render
-		 */
-		GridCoverage2D subCov = null;
-		try {
-			subCov = getFinalCoverage(request, mapLayerInfo, mapContent, coverageReader, destinationEnvelope);
-		} catch (Exception e) {
-			LOGGER.severe("Could not get a subcoverage");
-		}
-
-		if (subCov == null)
-		{
-			LOGGER.fine("Creating coverage from a blank image");
-			BufferedImage emptyImage = new BufferedImage(width, height, BufferedImage.TYPE_USHORT_GRAY);
-			DataBuffer data = emptyImage.getRaster().getDataBuffer();
-			for (int i = 0; i < data.getSize(); ++i) {
-				data.setElem(i, 32768); // 0x0080 in file (2^15)
+    	ImageOutputStream imageOutStream = null;
+        ImageWriter writer = null;
+        
+		try{
+			for (MapLayerInfo mapLayerInfo : reqlayers){
+				// Get BIL layer configuration. This configuration is set by the server administrator
+				// using the BIL layer config panel.
+				MetadataMap metadata = mapLayerInfo.getResource().getMetadata();
+			
+				String defaultDataType = (String) metadata.get(BilConfig.DEFAULT_DATA_TYPE);
+				String byteOrder = (String) metadata.get(BilConfig.BYTE_ORDER);
+	
+				Double outNoData = null;
+				Object noDataParam = metadata.get(BilConfig.NO_DATA_OUTPUT);
+				if (noDataParam instanceof Number)
+				{
+				    outNoData = ((Number) noDataParam).doubleValue();
+				} else if (noDataParam instanceof String)
+				{
+		    		try
+		    		{
+		    			outNoData = Double.parseDouble((String) noDataParam);
+		    		} catch (NumberFormatException e)
+		    		{
+		    			LOGGER.warning("Can't parse output no data attribute: " + e.getMessage()); // TODO localize
+		    		}
+				}
+	
+				GridCoverage2DReader coverageReader = (GridCoverage2DReader) mapLayerInfo.getCoverageReader();
+			    GeneralEnvelope destinationEnvelope = new GeneralEnvelope(mapContent.getRenderingArea());
+				
+				/*
+				 * Try to use a gridcoverage style render
+				 */
+				GridCoverage2D subCov = null;
+				try {
+					subCov = getFinalCoverage(request, mapLayerInfo, mapContent, coverageReader, destinationEnvelope);
+				} catch (Exception e) {
+					LOGGER.severe("Could not get a subcoverage");
+				}
+	
+				if (subCov == null)
+				{
+					LOGGER.fine("Creating coverage from a blank image");
+					BufferedImage emptyImage = new BufferedImage(width, height, BufferedImage.TYPE_USHORT_GRAY);
+					DataBuffer data = emptyImage.getRaster().getDataBuffer();
+					for (int i = 0; i < data.getSize(); ++i) {
+						data.setElem(i, 32768); // 0x0080 in file (2^15)
+					}
+					subCov = factory.create("uselessname", emptyImage, destinationEnvelope);
+				}
+	
+				if(subCov!=null)
+				{
+			        image = subCov.getRenderedImage();
+			        if(image!=null)
+			        {
+			        	int dtype = image.getData().getDataBuffer().getDataType();
+	
+			        	RenderedImage transformedImage = image;
+	
+		                // Perform NoData translation
+			        	final double[] inNoDataValues = CoverageUtilities.getBackgroundValues(
+			        			(GridCoverage2D) subCov);
+			        	if (inNoDataValues != null && outNoData != null)
+			        	{
+			        		// TODO should support multiple no-data values
+			        		final double inNoData = inNoDataValues[0];
+			        		
+			        		if (inNoData != outNoData)
+			        		{
+			        			ParameterBlock param = new ParameterBlock().addSource(image);
+			        			param = param.add(inNoData);
+			        			param = param.add(outNoData);
+			        			transformedImage = JAI.create(RecodeRaster.OPERATION_NAME, param, null);
+			        			}
+			        		}
+			        	
+			        	String bilEncoding = requestedBilEncoding;
+	
+			        	// Perform format conversion. If the requested encoding does not specify the format
+			        	// (i.e. application/bil or image/bil), then convert to the default encoding configured
+			        	// by the server administrator. Operator is not created if no conversion is necessary.
+			        	if (defaultDataType != null && ((bilEncoding.equals("application/bil") ||
+			        			requestedBilEncoding.equals("image/bil"))))
+			        	{
+			        		bilEncoding = defaultDataType;
+			        	}
+			        	ImageWorker worker = new ImageWorker(transformedImage);
+			        	Double nod = inNoDataValues != null ? (outNoData != null ? outNoData : inNoDataValues[0]) : null;
+			        	worker.setNoData(nod != null ? RangeFactory.create(nod, nod) : null);
+			        	if((bilEncoding.equals("application/bil32")) && (dtype != DataBuffer.TYPE_FLOAT))
+			        	{
+			        	    transformedImage = worker.format(DataBuffer.TYPE_FLOAT).getRenderedImage();
+			        	}
+			        	else if((bilEncoding.equals("application/bil16")) && (dtype != DataBuffer.TYPE_SHORT))
+			        	{
+			        	    transformedImage = worker.format(DataBuffer.TYPE_SHORT).getRenderedImage();
+			        	}
+			        	else if((bilEncoding.equals("application/bil8")) && (dtype != DataBuffer.TYPE_BYTE))
+			        	{
+			        	    transformedImage = worker.format(DataBuffer.TYPE_BYTE).getRenderedImage();
+			        	}
+	
+			        	TiledImage tiled = new TiledImage(transformedImage,width,height);
+			        	
+			        	if (imageOutStream == null) imageOutStream = ImageIO.createImageOutputStream(outStream);
+			            if (writer == null) writer = writerSPI.createWriterInstance();
+	
+				        // Set byte order out of output stream based on layer configuration.
+				        if (ByteOrder.LITTLE_ENDIAN.toString().equals(byteOrder))
+				        {
+				        	imageOutStream.setByteOrder(ByteOrder.LITTLE_ENDIAN);
+				        } else if (ByteOrder.BIG_ENDIAN.toString().equals(byteOrder))
+				        {
+				        	imageOutStream.setByteOrder(ByteOrder.BIG_ENDIAN);
+				        }
+	
+				        writer.setOutput(imageOutStream);
+				        writer.write(tiled);
+			        }
+			        else
+			        {
+			        	throw new ServiceException("Cannot render to BIL");
+			        }
+				}
+				else
+				{			
+					throw new ServiceException("You requested a bil of size:"+
+							height+"x"+width+",but you can't have it!!");
+	
+				}
 			}
-			subCov = factory.create("uselessname", emptyImage, destinationEnvelope);
-		}
-
-		if(subCov!=null)
-		{
-	        image = subCov.getRenderedImage();
-	        if(image!=null)
-	        {
-	        	int dtype = image.getData().getDataBuffer().getDataType();
-
-	        	RenderedImage transformedImage = image;
-
-                // Perform NoData translation
-	        	final double[] inNoDataValues = CoverageUtilities.getBackgroundValues(
-	        			(GridCoverage2D) subCov);
-	        	if (inNoDataValues != null && outNoData != null)
-	        	{
-	        		// TODO should support multiple no-data values
-	        		final double inNoData = inNoDataValues[0];
-
-	        		if (inNoData != outNoData)
-	        		{
-	        			ParameterBlock param = new ParameterBlock().addSource(image);
-	        			param = param.add(inNoData);
-	        			param = param.add(outNoData);
-	        			transformedImage = JAI.create(RecodeRaster.OPERATION_NAME, param, null);
-	        			}
-	        		}
-
-	        	// Perform format conversion. If the requested encoding does not specify the format
-	        	// (i.e. application/bil or image/bil), then convert to the default encoding configured
-	        	// by the server administrator. Operator is not created if no conversion is necessary.
-	        	if (defaultDataType != null && ((bilEncoding.equals("application/bil") ||
-	        			bilEncoding.equals("image/bil"))))
-	        	{
-	        		bilEncoding = defaultDataType;
-	        	}
-	        	ImageWorker worker = new ImageWorker(transformedImage);
-	        	Double nod = inNoDataValues != null ? (outNoData != null ? outNoData : inNoDataValues[0]) : null;
-	        	worker.setNoData(nod != null ? RangeFactory.create(nod, nod) : null);
-	        	if((bilEncoding.equals("application/bil32")) && (dtype != DataBuffer.TYPE_FLOAT))
-	        	{
-	        	    transformedImage = worker.format(DataBuffer.TYPE_FLOAT).getRenderedImage();
-	        	}
-	        	else if((bilEncoding.equals("application/bil16")) && (dtype != DataBuffer.TYPE_SHORT))
-	        	{
-	        	    transformedImage = worker.format(DataBuffer.TYPE_SHORT).getRenderedImage();
-	        	}
-	        	else if((bilEncoding.equals("application/bil8")) && (dtype != DataBuffer.TYPE_BYTE))
-	        	{
-	        	    transformedImage = worker.format(DataBuffer.TYPE_BYTE).getRenderedImage();
-	        	}
-
-	        	TiledImage tiled = new TiledImage(transformedImage,width,height);
-
-	        	final ImageOutputStream imageOutStream = ImageIO.createImageOutputStream(outStream);
-		        final ImageWriter writer = writerSPI.createWriterInstance();
-
-		        // Set byte order out of output stream based on layer configuration.
-		        if (ByteOrder.LITTLE_ENDIAN.toString().equals(byteOrder))
-		        {
-		        	imageOutStream.setByteOrder(ByteOrder.LITTLE_ENDIAN);
-		        } else if (ByteOrder.BIG_ENDIAN.toString().equals(byteOrder))
-		        {
-		        	imageOutStream.setByteOrder(ByteOrder.BIG_ENDIAN);
-		        }
-
-		        writer.setOutput(imageOutStream);
-		        writer.write(tiled);
+		}finally{
+			if (imageOutStream != null){
 		        imageOutStream.flush();
 		        imageOutStream.close();
-	        }
-	        else
-	        {
-	        	throw new ServiceException("Cannot render to BIL");
-	        }
-		}
-		else
-		{			
-			throw new ServiceException("You requested a bil of size:"+
-					height+"x"+width+",but you can't have it!!");
-
+			}
 		}
 	}
 	

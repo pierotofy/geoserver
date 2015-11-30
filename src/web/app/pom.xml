@@ -173,6 +173,11 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+	  <artifactId>jetty-servlets</artifactId>
+	  <version>7.0.1.v20091125</version>
+    </dependency>
+    <dependency>
       <groupId>org.geoserver</groupId>
       <artifactId>gs-main</artifactId>
       <version>${project.version}</version>
